@@ -62,10 +62,7 @@ const (
 )
 
 func newAggregator(params aggregatorParams) *aggregator {
-	interval := defaultAggregationCheckInterval
-	if params.gracePeriod < interval {
-		interval = params.gracePeriod
-	}
+	interval := min(params.gracePeriod, defaultAggregationCheckInterval)
 	return &aggregator{
 		logger:      params.logger,
 		broker:      params.broker,
@@ -156,7 +153,7 @@ func (a *aggregator) aggregate(t time.Time) {
 			}
 			tasks := make([]*Task, len(msgs))
 			for i, m := range msgs {
-				tasks[i] = NewTask(m.Type, m.Payload)
+				tasks[i] = NewTaskWithHeaders(m.Type, m.Payload, m.Headers)
 			}
 			aggregatedTask := a.ga.Aggregate(gname, tasks)
 			ctx, cancel := context.WithDeadline(context.Background(), deadline)

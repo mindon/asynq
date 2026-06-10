@@ -231,7 +231,7 @@ func TestProcessTasksWithLargeNumberInPayload(t *testing.T) {
 	defer r.Close()
 	rdbClient := rdb.NewRDB(r)
 
-	m1 := h.NewTaskMessage("large_number", h.JSON(map[string]interface{}{"data": 111111111111111111}))
+	m1 := h.NewTaskMessage("large_number", h.JSON(map[string]any{"data": 111111111111111111}))
 	t1 := NewTask(m1.Type, m1.Payload)
 
 	tests := []struct {
@@ -295,6 +295,7 @@ func TestProcessorRetry(t *testing.T) {
 
 	errMsg := "something went wrong"
 	wrappedSkipRetry := fmt.Errorf("%s:%w", errMsg, SkipRetry)
+	wrappedRevokeTask := fmt.Errorf("%s:%w", errMsg, RevokeTask)
 
 	tests := []struct {
 		desc         string              // test description
@@ -312,7 +313,7 @@ func TestProcessorRetry(t *testing.T) {
 			pending: []*base.TaskMessage{m1, m2, m3, m4},
 			delay:   time.Minute,
 			handler: HandlerFunc(func(ctx context.Context, task *Task) error {
-				return fmt.Errorf(errMsg)
+				return errors.New(errMsg)
 			}),
 			wait:         2 * time.Second,
 			wantErrMsg:   errMsg,
@@ -345,6 +346,32 @@ func TestProcessorRetry(t *testing.T) {
 			wantRetry:    []*base.TaskMessage{},
 			wantArchived: []*base.TaskMessage{m1, m2},
 			wantErrCount: 2, // ErrorHandler should still be called with SkipRetry error
+		},
+		{
+			desc:    "Should revoke task",
+			pending: []*base.TaskMessage{m1, m2},
+			delay:   time.Minute,
+			handler: HandlerFunc(func(ctx context.Context, task *Task) error {
+				return RevokeTask // return RevokeTask without wrapping
+			}),
+			wait:         2 * time.Second,
+			wantErrMsg:   RevokeTask.Error(),
+			wantRetry:    []*base.TaskMessage{},
+			wantArchived: []*base.TaskMessage{},
+			wantErrCount: 2, // ErrorHandler should still be called with RevokeTask error
+		},
+		{
+			desc:    "Should revoke task (with error wrapping)",
+			pending: []*base.TaskMessage{m1, m2},
+			delay:   time.Minute,
+			handler: HandlerFunc(func(ctx context.Context, task *Task) error {
+				return wrappedRevokeTask
+			}),
+			wait:         2 * time.Second,
+			wantErrMsg:   wrappedRevokeTask.Error(),
+			wantRetry:    []*base.TaskMessage{},
+			wantArchived: []*base.TaskMessage{},
+			wantErrCount: 2, // ErrorHandler should still be called with RevokeTask error
 		},
 	}
 
@@ -742,7 +769,7 @@ func TestProcessorPerform(t *testing.T) {
 			handler: func(ctx context.Context, t *Task) error {
 				return nil
 			},
-			task:    NewTask("gen_thumbnail", h.JSON(map[string]interface{}{"src": "some/img/path"})),
+			task:    NewTask("gen_thumbnail", h.JSON(map[string]any{"src": "some/img/path"})),
 			wantErr: false,
 		},
 		{
@@ -750,7 +777,7 @@ func TestProcessorPerform(t *testing.T) {
 			handler: func(ctx context.Context, t *Task) error {
 				return fmt.Errorf("something went wrong")
 			},
-			task:    NewTask("gen_thumbnail", h.JSON(map[string]interface{}{"src": "some/img/path"})),
+			task:    NewTask("gen_thumbnail", h.JSON(map[string]any{"src": "some/img/path"})),
 			wantErr: true,
 		},
 		{
@@ -758,7 +785,7 @@ func TestProcessorPerform(t *testing.T) {
 			handler: func(ctx context.Context, t *Task) error {
 				panic("something went terribly wrong")
 			},
-			task:    NewTask("gen_thumbnail", h.JSON(map[string]interface{}{"src": "some/img/path"})),
+			task:    NewTask("gen_thumbnail", h.JSON(map[string]any{"src": "some/img/path"})),
 			wantErr: true,
 		},
 	}
@@ -928,7 +955,7 @@ func TestProcessorComputeDeadline(t *testing.T) {
 
 func TestReturnPanicError(t *testing.T) {
 
-	task := NewTask("gen_thumbnail", h.JSON(map[string]interface{}{"src": "some/img/path"}))
+	task := NewTask("gen_thumbnail", h.JSON(map[string]any{"src": "some/img/path"}))
 
 	tests := []struct {
 		name         string

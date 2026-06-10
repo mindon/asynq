@@ -160,6 +160,209 @@ func TestEnqueueTaskIdConflictError(t *testing.T) {
 	}
 }
 
+func TestBatchEnqueue(t *testing.T) {
+	r := setup(t)
+	defer r.Close()
+
+	t1 := h.NewTaskMessage("send_email", h.JSON(map[string]interface{}{"to": "user@example.com"}))
+	t2 := h.NewTaskMessageWithQueue("generate_csv", h.JSON(map[string]interface{}{}), "csv")
+	t3 := h.NewTaskMessageWithQueue("sync", nil, "low")
+
+	enqueueTime := time.Now()
+	r.SetClock(timeutil.NewSimulatedClock(enqueueTime))
+
+	t.Run("enqueue multiple tasks", func(t *testing.T) {
+		h.FlushDB(t, r.client)
+		items := []base.BatchEnqueueItem{
+			{Msg: t1},
+			{Msg: t2},
+			{Msg: t3},
+		}
+
+		n, err := r.BatchEnqueue(context.Background(), items)
+		if err != nil {
+			t.Fatalf("BatchEnqueue returned error: %v", err)
+		}
+		if n != 3 {
+			t.Errorf("BatchEnqueue returned %d, want 3", n)
+		}
+
+		for _, item := range items {
+			msg := item.Msg
+			pendingKey := base.PendingKey(msg.Queue)
+			pendingIDs := r.client.LRange(context.Background(), pendingKey, 0, -1).Val()
+			found := false
+			for _, id := range pendingIDs {
+				if id == msg.ID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("task %s not found in pending list %s", msg.ID, pendingKey)
+			}
+
+			taskKey := base.TaskKey(msg.Queue, msg.ID)
+			state := r.client.HGet(context.Background(), taskKey, "state").Val()
+			if state != "pending" {
+				t.Errorf("state for task %s = %q, want %q", msg.ID, state, "pending")
+			}
+		}
+	})
+
+	t.Run("empty batch", func(t *testing.T) {
+		h.FlushDB(t, r.client)
+
+		n, err := r.BatchEnqueue(context.Background(), nil)
+		if err != nil {
+			t.Fatalf("BatchEnqueue(nil) returned error: %v", err)
+		}
+		if n != 0 {
+			t.Errorf("BatchEnqueue(nil) returned %d, want 0", n)
+		}
+	})
+
+	t.Run("duplicate IDs skipped", func(t *testing.T) {
+		h.FlushDB(t, r.client)
+
+		if err := r.Enqueue(context.Background(), t1); err != nil {
+			t.Fatalf("pre-enqueue failed: %v", err)
+		}
+
+		dup := *t1
+		newMsg := h.NewTaskMessage("new_task", nil)
+
+		items := []base.BatchEnqueueItem{
+			{Msg: &dup},
+			{Msg: newMsg},
+		}
+		n, err := r.BatchEnqueue(context.Background(), items)
+		if err != nil {
+			t.Fatalf("BatchEnqueue returned error: %v", err)
+		}
+		if n != 1 {
+			t.Errorf("BatchEnqueue returned %d, want 1 (duplicate should be skipped)", n)
+		}
+	})
+
+	t.Run("scheduled tasks", func(t *testing.T) {
+		h.FlushDB(t, r.client)
+
+		future := time.Now().Add(1 * time.Hour)
+		s1 := h.NewTaskMessage("deferred_email", nil)
+		items := []base.BatchEnqueueItem{
+			{Msg: t1},
+			{Msg: s1, ProcessAt: future},
+		}
+
+		n, err := r.BatchEnqueue(context.Background(), items)
+		if err != nil {
+			t.Fatalf("BatchEnqueue returned error: %v", err)
+		}
+		if n != 2 {
+			t.Errorf("BatchEnqueue returned %d, want 2", n)
+		}
+
+		// Immediate task should be in pending.
+		pendingIDs := r.client.LRange(context.Background(), base.PendingKey(t1.Queue), 0, -1).Val()
+		foundPending := false
+		for _, id := range pendingIDs {
+			if id == t1.ID {
+				foundPending = true
+			}
+		}
+		if !foundPending {
+			t.Errorf("immediate task %s not found in pending list", t1.ID)
+		}
+
+		// Scheduled task should be in scheduled set.
+		scheduledIDs := r.client.ZRange(context.Background(), base.ScheduledKey(s1.Queue), 0, -1).Val()
+		foundScheduled := false
+		for _, id := range scheduledIDs {
+			if id == s1.ID {
+				foundScheduled = true
+			}
+		}
+		if !foundScheduled {
+			t.Errorf("scheduled task %s not found in scheduled set", s1.ID)
+		}
+
+		taskKey := base.TaskKey(s1.Queue, s1.ID)
+		state := r.client.HGet(context.Background(), taskKey, "state").Val()
+		if state != "scheduled" {
+			t.Errorf("state for scheduled task %s = %q, want %q", s1.ID, state, "scheduled")
+		}
+	})
+
+	t.Run("pipeline error from cancelled context", func(t *testing.T) {
+		h.FlushDB(t, r.client)
+
+		msg := h.NewTaskMessage("pipeline_error_task", nil)
+		items := []base.BatchEnqueueItem{{Msg: msg}}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		_, err := r.BatchEnqueue(ctx, items)
+		if err == nil {
+			t.Error("BatchEnqueue with cancelled context returned nil error, want non-nil")
+		}
+	})
+}
+
+func TestEnqueueQueueCache(t *testing.T) {
+	r := setup(t)
+	defer r.Close()
+	t1 := h.NewTaskMessageWithQueue("sync1", nil, "low")
+
+	enqueueTime := time.Now()
+	clock := timeutil.NewSimulatedClock(enqueueTime)
+	r.SetClock(clock)
+
+	err := r.Enqueue(context.Background(), t1)
+	if err != nil {
+		t.Fatalf("(*RDB).Enqueue(msg) = %v, want nil", err)
+	}
+
+	// Check queue is in the AllQueues set.
+	if !r.client.SIsMember(context.Background(), base.AllQueues, t1.Queue).Val() {
+		t.Fatalf("%q is not a member of SET %q", t1.Queue, base.AllQueues)
+	}
+
+	if _, ok := r.queuesPublished.Load(t1.Queue); !ok {
+		t.Fatalf("%q is not cached in queuesPublished", t1.Queue)
+	}
+
+	t.Run("remove-queue", func(t *testing.T) {
+		err := r.RemoveQueue(t1.Queue, true)
+		if err != nil {
+			t.Errorf("(*RDB).RemoveQueue(%q, %t) = %v, want nil", t1.Queue, true, err)
+		}
+
+		if _, ok := r.queuesPublished.Load(t1.Queue); ok {
+			t.Fatalf("%q is still cached in queuesPublished", t1.Queue)
+		}
+
+		if r.client.SIsMember(context.Background(), base.AllQueues, t1.Queue).Val() {
+			t.Fatalf("%q is a member of SET %q", t1.Queue, base.AllQueues)
+		}
+
+		err = r.Enqueue(context.Background(), t1)
+		if err != nil {
+			t.Fatalf("(*RDB).Enqueue(msg) = %v, want nil", err)
+		}
+
+		// Check queue is in the AllQueues set.
+		if !r.client.SIsMember(context.Background(), base.AllQueues, t1.Queue).Val() {
+			t.Fatalf("%q is not a member of SET %q", t1.Queue, base.AllQueues)
+		}
+
+		if _, ok := r.queuesPublished.Load(t1.Queue); !ok {
+			t.Fatalf("%q is not cached in queuesPublished", t1.Queue)
+		}
+	})
+}
+
 func TestEnqueueUnique(t *testing.T) {
 	r := setup(t)
 	defer r.Close()
@@ -2002,7 +2205,6 @@ func TestArchive(t *testing.T) {
 	}
 	errMsg := "SMTP server not responding"
 
-	// TODO(hibiken): add test cases for trimming
 	tests := []struct {
 		active       map[string][]*base.TaskMessage
 		lease        map[string][]base.Z
@@ -2167,6 +2369,163 @@ func TestArchive(t *testing.T) {
 		gotFailedTotal := r.client.Get(context.Background(), failedTotalKey).Val()
 		if gotFailedTotal != "1" {
 			t.Errorf("GET %q = %q, want 1", failedTotalKey, gotFailedTotal)
+		}
+	}
+}
+
+func TestArchiveTrim(t *testing.T) {
+	r := setup(t)
+	defer r.Close()
+	now := time.Now()
+	r.SetClock(timeutil.NewSimulatedClock(now))
+
+	t1 := &base.TaskMessage{
+		ID:      uuid.NewString(),
+		Type:    "send_email",
+		Payload: nil,
+		Queue:   "default",
+		Retry:   25,
+		Retried: 25,
+		Timeout: 1800,
+	}
+	t2 := &base.TaskMessage{
+		ID:      uuid.NewString(),
+		Type:    "reindex",
+		Payload: nil,
+		Queue:   "default",
+		Retry:   25,
+		Retried: 0,
+		Timeout: 3000,
+	}
+	errMsg := "SMTP server not responding"
+
+	maxArchiveSet := make([]base.Z, 0)
+	for i := 0; i < maxArchiveSize-1; i++ {
+		maxArchiveSet = append(maxArchiveSet, base.Z{Message: &base.TaskMessage{
+			ID:      uuid.NewString(),
+			Type:    "generate_csv",
+			Payload: nil,
+			Queue:   "default",
+			Retry:   25,
+			Retried: 0,
+			Timeout: 60,
+		}, Score: now.Add(-time.Hour + -time.Second*time.Duration(i)).Unix()})
+	}
+
+	wantMaxArchiveSet := make([]base.Z, 0)
+	// newly archived task should be at the front
+	wantMaxArchiveSet = append(wantMaxArchiveSet, base.Z{Message: h.TaskMessageWithError(*t1, errMsg, now), Score: now.Unix()})
+	// oldest task should be dropped from the set
+	wantMaxArchiveSet = append(wantMaxArchiveSet, maxArchiveSet[:len(maxArchiveSet)-1]...)
+
+	tests := []struct {
+		toArchive    map[string][]*base.TaskMessage
+		lease        map[string][]base.Z
+		archived     map[string][]base.Z
+		wantArchived map[string][]base.Z
+	}{
+		{ // simple, 1 to be archived, 1 already archived, both are in the archive set
+			toArchive: map[string][]*base.TaskMessage{
+				"default": {t1},
+			},
+			lease: map[string][]base.Z{
+				"default": {
+					{Message: t1, Score: now.Add(10 * time.Second).Unix()},
+				},
+			},
+			archived: map[string][]base.Z{
+				"default": {
+					{Message: t2, Score: now.Add(-time.Hour).Unix()},
+				},
+			},
+			wantArchived: map[string][]base.Z{
+				"default": {
+					{Message: h.TaskMessageWithError(*t1, errMsg, now), Score: now.Unix()},
+					{Message: t2, Score: now.Add(-time.Hour).Unix()},
+				},
+			},
+		},
+		{ // 1 to be archived, 1 already archived but past expiry, only the newly archived task should be left
+			toArchive: map[string][]*base.TaskMessage{
+				"default": {t1},
+			},
+			lease: map[string][]base.Z{
+				"default": {
+					{Message: t1, Score: now.Add(10 * time.Second).Unix()},
+				},
+			},
+			archived: map[string][]base.Z{
+				"default": {
+					{Message: t2, Score: now.Add(-time.Hour * 24 * (archivedExpirationInDays + 1)).Unix()},
+				},
+			},
+			wantArchived: map[string][]base.Z{
+				"default": {
+					{Message: h.TaskMessageWithError(*t1, errMsg, now), Score: now.Unix()},
+				},
+			},
+		},
+		{ // 1 to be archived, maxArchiveSize in archive set, archive set should be trimmed back to maxArchiveSize and newly archived task should be in the set
+			toArchive: map[string][]*base.TaskMessage{
+				"default": {t1},
+			},
+			lease: map[string][]base.Z{
+				"default": {
+					{Message: t1, Score: now.Add(10 * time.Second).Unix()},
+				},
+			},
+			archived: map[string][]base.Z{
+				"default": maxArchiveSet,
+			},
+			wantArchived: map[string][]base.Z{
+				"default": wantMaxArchiveSet,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		h.FlushDB(t, r.client) // clean up db before each test case
+		h.SeedAllActiveQueues(t, r.client, tc.toArchive)
+		h.SeedAllLease(t, r.client, tc.lease)
+		h.SeedAllArchivedQueues(t, r.client, tc.archived)
+
+		for _, tasks := range tc.toArchive {
+			for _, target := range tasks {
+				err := r.Archive(context.Background(), target, errMsg)
+				if err != nil {
+					t.Errorf("(*RDB).Archive(%v, %v) = %v, want nil", target, errMsg, err)
+					continue
+				}
+			}
+		}
+
+		for queue, want := range tc.wantArchived {
+			gotArchived := h.GetArchivedEntries(t, r.client, queue)
+
+			if diff := cmp.Diff(want, gotArchived, h.SortZSetEntryOpt, zScoreCmpOpt, timeCmpOpt); diff != "" {
+				t.Errorf("mismatch found in %q after calling (*RDB).Archive: (-want, +got):\n%s", base.ArchivedKey(queue), diff)
+			}
+
+			// check that only keys present in the archived set are in rdb
+			vals := r.client.Keys(context.Background(), base.TaskKeyPrefix(queue)+"*").Val()
+			if len(vals) != len(gotArchived) {
+				t.Errorf("len of keys = %v, want %v", len(vals), len(gotArchived))
+				return
+			}
+
+			for _, val := range vals {
+				found := false
+				for _, entry := range gotArchived {
+					if strings.Contains(val, entry.Message.ID) {
+						found = true
+						break
+					}
+				}
+
+				if !found {
+					t.Errorf("key %v not found in archived set (it was orphaned by the archive trim)", val)
+				}
+			}
 		}
 	}
 }
@@ -2542,8 +2901,8 @@ func TestDeleteExpiredCompletedTasks(t *testing.T) {
 		h.FlushDB(t, r.client)
 		h.SeedAllCompletedQueues(t, r.client, tc.completed)
 
-		if err := r.DeleteExpiredCompletedTasks(tc.qname); err != nil {
-			t.Errorf("DeleteExpiredCompletedTasks(%q) failed: %v", tc.qname, err)
+		if err := r.DeleteExpiredCompletedTasks(tc.qname, 100); err != nil {
+			t.Errorf("DeleteExpiredCompletedTasks(%q, 100) failed: %v", tc.qname, err)
 			continue
 		}
 
@@ -3050,7 +3409,7 @@ func TestCancelationPubSub(t *testing.T) {
 	publish := []string{"one", "two", "three"}
 
 	for _, msg := range publish {
-		r.PublishCancelation(msg)
+		_ = r.PublishCancelation(msg)
 	}
 
 	// allow for message to reach subscribers.
@@ -3063,6 +3422,29 @@ func TestCancelationPubSub(t *testing.T) {
 		t.Errorf("subscriber received %v, want %v; (-want,+got)\n%s", received, publish, diff)
 	}
 	mu.Unlock()
+}
+
+func TestCancelationPubSubReceiveError(t *testing.T) {
+	// Use a client connected to a non-existent Redis server to trigger
+	// a Receive() error. This verifies that the pubsub connection is
+	// closed on error, preventing connection leaks.
+	client := redis.NewClient(&redis.Options{
+		Addr: "localhost:0", // invalid port — connection will fail
+	})
+	r := NewRDB(client)
+	defer r.Close()
+
+	pubsub, err := r.CancelationPubSub()
+	if err == nil {
+		// If no error, we must clean up the pubsub.
+		if pubsub != nil {
+			pubsub.Close()
+		}
+		t.Fatal("(*RDB).CancelationPubSub() expected to return an error when redis is unreachable")
+	}
+	if pubsub != nil {
+		t.Error("(*RDB).CancelationPubSub() expected nil pubsub on error")
+	}
 }
 
 func TestWriteResult(t *testing.T) {

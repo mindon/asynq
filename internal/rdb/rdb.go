@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -27,8 +28,9 @@ const LeaseDuration = 30 * time.Second
 
 // RDB is a client interface to query and mutate task queues.
 type RDB struct {
-	client redis.UniversalClient
-	clock  timeutil.Clock
+	client          redis.UniversalClient
+	clock           timeutil.Clock
+	queuesPublished sync.Map
 }
 
 // NewRDB returns a new instance of RDB.
@@ -113,8 +115,11 @@ func (r *RDB) Enqueue(ctx context.Context, msg *base.TaskMessage) error {
 	if err != nil {
 		return errors.E(op, errors.Unknown, fmt.Sprintf("cannot encode message: %v", err))
 	}
-	if err := r.client.SAdd(ctx, base.AllQueues, msg.Queue).Err(); err != nil {
-		return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "sadd", Err: err})
+	if _, found := r.queuesPublished.Load(msg.Queue); !found {
+		if err := r.client.SAdd(ctx, base.AllQueues, msg.Queue).Err(); err != nil {
+			return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "sadd", Err: err})
+		}
+		r.queuesPublished.Store(msg.Queue, true)
 	}
 	keys := []string{
 		base.TaskKey(msg.Queue, msg.ID),
@@ -134,6 +139,118 @@ func (r *RDB) Enqueue(ctx context.Context, msg *base.TaskMessage) error {
 	}
 	r.state(ctx, msg, base.TaskStatePending)
 	return nil
+}
+
+// BatchEnqueue adds all given tasks to Redis using a single pipeline round-trip.
+// Each item is either enqueued immediately (ProcessAt is zero) or added to the
+// scheduled sorted set.
+//
+// WARNING: tasks whose IDs already exist in Redis are silently skipped.
+//
+// The pipeline executes independent Lua scripts per task — there is no
+// MULTI/EXEC wrapping the batch, so individual tasks may succeed or fail
+// independently. The returned int is the number of tasks actually written;
+// skipped duplicates do not count. The returned error is non-nil only when the
+// pipeline call itself fails (network error, context cancellation, etc.), in
+// which case no individual result should be trusted.
+//
+// Message encoding errors cause an immediate return before any Redis I/O.
+func (r *RDB) BatchEnqueue(ctx context.Context, items []base.BatchEnqueueItem) (int, error) {
+	var op errors.Op = "rdb.BatchEnqueue"
+	if len(items) == 0 {
+		return 0, nil
+	}
+
+	// Preload Lua scripts so that EVALSHA inside the pipeline does not fail with
+	// NOSCRIPT. Script.Run on a pipeline only sends EVALSHA (unlike non-pipeline
+	// Run which retries with EVAL on NOSCRIPT).
+	needsEnqueue, needsSchedule := false, false
+	for _, item := range items {
+		if item.ProcessAt.IsZero() {
+			needsEnqueue = true
+		} else {
+			needsSchedule = true
+		}
+		if needsEnqueue && needsSchedule {
+			break
+		}
+	}
+	if needsEnqueue {
+		if err := enqueueCmd.Load(ctx, r.client).Err(); err != nil {
+			return 0, errors.E(op, errors.Unknown, fmt.Sprintf("failed to load enqueue script: %v", err))
+		}
+	}
+	if needsSchedule {
+		if err := scheduleCmd.Load(ctx, r.client).Err(); err != nil {
+			return 0, errors.E(op, errors.Unknown, fmt.Sprintf("failed to load schedule script: %v", err))
+		}
+	}
+
+	pipe := r.client.Pipeline()
+
+	// Track which pipeline slot holds each item's script result.
+	scriptIdxs := make([]int, 0, len(items))
+	pipeLen := 0
+
+	// Track queues we add to AllQueues in this pipeline so we can roll back the
+	// in-memory cache on failure.
+	var newQueues []string
+
+	now := r.clock.Now().UnixNano()
+
+	for _, item := range items {
+		encoded, err := base.EncodeMessage(item.Msg)
+		if err != nil {
+			return 0, errors.E(op, errors.Unknown, fmt.Sprintf("cannot encode message: %v", err))
+		}
+		if _, found := r.queuesPublished.Load(item.Msg.Queue); !found {
+			pipe.SAdd(ctx, base.AllQueues, item.Msg.Queue)
+			r.queuesPublished.Store(item.Msg.Queue, true)
+			newQueues = append(newQueues, item.Msg.Queue)
+			pipeLen++
+		}
+
+		if item.ProcessAt.IsZero() {
+			keys := []string{
+				base.TaskKey(item.Msg.Queue, item.Msg.ID),
+				base.PendingKey(item.Msg.Queue),
+			}
+			argv := []interface{}{encoded, item.Msg.ID, now}
+			enqueueCmd.Run(ctx, pipe, keys, argv...)
+		} else {
+			keys := []string{
+				base.TaskKey(item.Msg.Queue, item.Msg.ID),
+				base.ScheduledKey(item.Msg.Queue),
+			}
+			argv := []interface{}{encoded, item.ProcessAt.Unix(), item.Msg.ID}
+			scheduleCmd.Run(ctx, pipe, keys, argv...)
+		}
+		scriptIdxs = append(scriptIdxs, pipeLen)
+		pipeLen++
+	}
+
+	cmds, err := pipe.Exec(ctx)
+	if err != nil && err != redis.Nil {
+		for _, q := range newQueues {
+			r.queuesPublished.Delete(q)
+		}
+		return 0, errors.E(op, errors.Unknown, fmt.Sprintf("redis pipeline error: %v", err))
+	}
+
+	enqueued := 0
+	for _, idx := range scriptIdxs {
+		if idx >= len(cmds) {
+			continue
+		}
+		res, err := cmds[idx].(*redis.Cmd).Result()
+		if err != nil {
+			continue
+		}
+		if n, ok := res.(int64); ok && n == 1 {
+			enqueued++
+		}
+	}
+	return enqueued, nil
 }
 
 // enqueueUniqueCmd enqueues the task message if the task is unique.
@@ -176,8 +293,11 @@ func (r *RDB) EnqueueUnique(ctx context.Context, msg *base.TaskMessage, ttl time
 	if err != nil {
 		return errors.E(op, errors.Internal, "cannot encode task message: %v", err)
 	}
-	if err := r.client.SAdd(ctx, base.AllQueues, msg.Queue).Err(); err != nil {
-		return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "sadd", Err: err})
+	if _, found := r.queuesPublished.Load(msg.Queue); !found {
+		if err := r.client.SAdd(ctx, base.AllQueues, msg.Queue).Err(); err != nil {
+			return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "sadd", Err: err})
+		}
+		r.queuesPublished.Store(msg.Queue, true)
 	}
 	keys := []string{
 		msg.UniqueKey,
@@ -538,8 +658,11 @@ func (r *RDB) AddToGroup(ctx context.Context, msg *base.TaskMessage, groupKey st
 	if err != nil {
 		return errors.E(op, errors.Unknown, fmt.Sprintf("cannot encode message: %v", err))
 	}
-	if err := r.client.SAdd(ctx, base.AllQueues, msg.Queue).Err(); err != nil {
-		return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "sadd", Err: err})
+	if _, found := r.queuesPublished.Load(msg.Queue); !found {
+		if err := r.client.SAdd(ctx, base.AllQueues, msg.Queue).Err(); err != nil {
+			return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "sadd", Err: err})
+		}
+		r.queuesPublished.Store(msg.Queue, true)
 	}
 	keys := []string{
 		base.TaskKey(msg.Queue, msg.ID),
@@ -601,8 +724,11 @@ func (r *RDB) AddToGroupUnique(ctx context.Context, msg *base.TaskMessage, group
 	if err != nil {
 		return errors.E(op, errors.Unknown, fmt.Sprintf("cannot encode message: %v", err))
 	}
-	if err := r.client.SAdd(ctx, base.AllQueues, msg.Queue).Err(); err != nil {
-		return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "sadd", Err: err})
+	if _, found := r.queuesPublished.Load(msg.Queue); !found {
+		if err := r.client.SAdd(ctx, base.AllQueues, msg.Queue).Err(); err != nil {
+			return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "sadd", Err: err})
+		}
+		r.queuesPublished.Store(msg.Queue, true)
 	}
 	keys := []string{
 		base.TaskKey(msg.Queue, msg.ID),
@@ -659,8 +785,11 @@ func (r *RDB) Schedule(ctx context.Context, msg *base.TaskMessage, processAt tim
 	if err != nil {
 		return errors.E(op, errors.Unknown, fmt.Sprintf("cannot encode message: %v", err))
 	}
-	if err := r.client.SAdd(ctx, base.AllQueues, msg.Queue).Err(); err != nil {
-		return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "sadd", Err: err})
+	if _, found := r.queuesPublished.Load(msg.Queue); !found {
+		if err := r.client.SAdd(ctx, base.AllQueues, msg.Queue).Err(); err != nil {
+			return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "sadd", Err: err})
+		}
+		r.queuesPublished.Store(msg.Queue, true)
 	}
 	keys := []string{
 		base.TaskKey(msg.Queue, msg.ID),
@@ -719,8 +848,11 @@ func (r *RDB) ScheduleUnique(ctx context.Context, msg *base.TaskMessage, process
 	if err != nil {
 		return errors.E(op, errors.Internal, fmt.Sprintf("cannot encode task message: %v", err))
 	}
-	if err := r.client.SAdd(ctx, base.AllQueues, msg.Queue).Err(); err != nil {
-		return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "sadd", Err: err})
+	if _, found := r.queuesPublished.Load(msg.Queue); !found {
+		if err := r.client.SAdd(ctx, base.AllQueues, msg.Queue).Err(); err != nil {
+			return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "sadd", Err: err})
+		}
+		r.queuesPublished.Store(msg.Queue, true)
 	}
 	keys := []string{
 		msg.UniqueKey,
@@ -844,6 +976,7 @@ const (
 // KEYS[6] -> asynq:{<qname>}:failed:<yyyy-mm-dd>
 // KEYS[7] -> asynq:{<qname>}:processed
 // KEYS[8] -> asynq:{<qname>}:failed
+// KEYS[9] -> asynq:{<qname>}:t:
 // -------
 // ARGV[1] -> task ID
 // ARGV[2] -> updated base.TaskMessage value
@@ -860,8 +993,22 @@ if redis.call("ZREM", KEYS[3], ARGV[1]) == 0 then
   return redis.error_reply("NOT FOUND")
 end
 redis.call("ZADD", KEYS[4], ARGV[3], ARGV[1])
-redis.call("ZREMRANGEBYSCORE", KEYS[4], "-inf", ARGV[4])
-redis.call("ZREMRANGEBYRANK", KEYS[4], 0, -ARGV[5])
+local old = redis.call("ZRANGE", KEYS[4], "-inf", ARGV[4], "BYSCORE")
+if #old > 0 then
+	for _, id in ipairs(old) do
+		redis.call("DEL", KEYS[9] .. id)
+	end
+	redis.call("ZREM", KEYS[4], unpack(old))
+end
+
+local extra = redis.call("ZRANGE", KEYS[4], 0, -ARGV[5])
+if #extra > 0 then
+	for _, id in ipairs(extra) do
+		redis.call("DEL", KEYS[9] .. id)
+	end
+	redis.call("ZREM", KEYS[4], unpack(extra))
+end
+
 redis.call("HSET", KEYS[1], "msg", ARGV[2], "state", "archived")
 local n = redis.call("INCR", KEYS[5])
 if tonumber(n) == 1 then
@@ -904,6 +1051,7 @@ func (r *RDB) Archive(ctx context.Context, msg *base.TaskMessage, errMsg string)
 		base.FailedKey(msg.Queue, now),
 		base.ProcessedTotalKey(msg.Queue),
 		base.FailedTotalKey(msg.Queue),
+		base.TaskKeyPrefix(msg.Queue),
 	}
 	argv := []interface{}{
 		msg.ID,
@@ -1234,7 +1382,7 @@ redis.call("ZREMRANGEBYSCORE", KEYS[1], "-inf", ARGV[1])
 return redis.status_reply("OK")
 `)
 
-// ReclaimStateAggregationSets checks for any stale aggregation sets in the given queue, and
+// ReclaimStaleAggregationSets checks for any stale aggregation sets in the given queue, and
 // reclaim tasks in the stale aggregation set by putting them back in the group.
 func (r *RDB) ReclaimStaleAggregationSets(qname string) error {
 	var op errors.Op = "RDB.ReclaimStaleAggregationSets"
@@ -1258,9 +1406,7 @@ return table.getn(ids)`)
 
 // DeleteExpiredCompletedTasks checks for any expired tasks in the given queue's completed set,
 // and delete all expired tasks.
-func (r *RDB) DeleteExpiredCompletedTasks(qname string) error {
-	// Note: Do this operation in fix batches to prevent long running script.
-	const batchSize = 100
+func (r *RDB) DeleteExpiredCompletedTasks(qname string, batchSize int) error {
 	for {
 		n, err := r.deleteExpiredCompletedTasks(qname, batchSize)
 		if err != nil {
@@ -1420,7 +1566,7 @@ func (r *RDB) ClearServerState(host string, pid int, serverID string) error {
 
 // KEYS[1]  -> asynq:schedulers:{<schedulerID>}
 // ARGV[1]  -> TTL in seconds
-// ARGV[2:] -> schedler entries
+// ARGV[2:] -> scheduler entries
 var writeSchedulerEntriesCmd = redis.NewScript(`
 redis.call("DEL", KEYS[1])
 for i = 2, #ARGV do
@@ -1451,10 +1597,10 @@ func (r *RDB) WriteSchedulerEntries(schedulerID string, entries []*base.Schedule
 }
 
 // ClearSchedulerEntries deletes scheduler entries data from redis.
-func (r *RDB) ClearSchedulerEntries(scheduelrID string) error {
+func (r *RDB) ClearSchedulerEntries(schedulerID string) error {
 	var op errors.Op = "rdb.ClearSchedulerEntries"
 	ctx := context.Background()
-	key := base.SchedulerEntriesKey(scheduelrID)
+	key := base.SchedulerEntriesKey(schedulerID)
 	if err := r.client.ZRem(ctx, base.AllSchedulers, key).Err(); err != nil {
 		return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "zrem", Err: err})
 	}
@@ -1544,6 +1690,7 @@ func (r *RDB) CancelationPubSub() (*redis.PubSub, error) {
 	pubsub := r.client.Subscribe(ctx, base.CancelChannel)
 	_, err := pubsub.Receive(ctx)
 	if err != nil {
+		pubsub.Close()
 		return nil, errors.E(op, errors.Unknown, fmt.Sprintf("redis pubsub receive error: %v", err))
 	}
 	return pubsub, nil

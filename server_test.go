@@ -14,8 +14,34 @@ import (
 	"github.com/hibiken/asynq/internal/rdb"
 	"github.com/hibiken/asynq/internal/testbroker"
 	"github.com/hibiken/asynq/internal/testutil"
+
+	"github.com/redis/go-redis/v9"
 	"go.uber.org/goleak"
 )
+
+func testServer(t *testing.T, c *Client, srv *Server) {
+	// no-op handler
+	h := func(ctx context.Context, task *Task) error {
+		return nil
+	}
+
+	err := srv.Start(HandlerFunc(h))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = c.Enqueue(NewTask("send_email", testutil.JSON(map[string]any{"recipient_id": 123})))
+	if err != nil {
+		t.Errorf("could not enqueue a task: %v", err)
+	}
+
+	_, err = c.Enqueue(NewTask("send_email", testutil.JSON(map[string]any{"recipient_id": 456})), ProcessIn(1*time.Hour))
+	if err != nil {
+		t.Errorf("could not enqueue a task: %v", err)
+	}
+
+	srv.Shutdown()
+}
 
 func TestServer(t *testing.T) {
 	// https://github.com/go-redis/redis/issues/1029
@@ -30,27 +56,28 @@ func TestServer(t *testing.T) {
 		LogLevel:    testLogLevel,
 	})
 
-	// no-op handler
-	h := func(ctx context.Context, task *Task) error {
-		return nil
-	}
+	testServer(t, c, srv)
+}
 
-	err := srv.Start(HandlerFunc(h))
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestServerFromRedisClient(t *testing.T) {
+	// https://github.com/go-redis/redis/issues/1029
+	ignoreOpt := goleak.IgnoreTopFunction("github.com/redis/go-redis/v9/internal/pool.(*ConnPool).reaper")
+	defer goleak.VerifyNone(t, ignoreOpt)
 
-	_, err = c.Enqueue(NewTask("send_email", testutil.JSON(map[string]interface{}{"recipient_id": 123})))
-	if err != nil {
-		t.Errorf("could not enqueue a task: %v", err)
-	}
+	redisConnOpt := getRedisConnOpt(t)
+	redisClient := redisConnOpt.MakeRedisClient().(redis.UniversalClient)
+	c := NewClientFromRedisClient(redisClient)
+	srv := NewServerFromRedisClient(redisClient, Config{
+		Concurrency: 10,
+		LogLevel:    testLogLevel,
+	})
 
-	_, err = c.Enqueue(NewTask("send_email", testutil.JSON(map[string]interface{}{"recipient_id": 456})), ProcessIn(1*time.Hour))
-	if err != nil {
-		t.Errorf("could not enqueue a task: %v", err)
-	}
+	testServer(t, c, srv)
 
-	srv.Shutdown()
+	err := c.Close()
+	if err == nil {
+		t.Error("client.Close() should have failed because of a shared client but it didn't")
+	}
 }
 
 func TestServerRun(t *testing.T) {
@@ -58,13 +85,13 @@ func TestServerRun(t *testing.T) {
 	ignoreOpt := goleak.IgnoreTopFunction("github.com/redis/go-redis/v9/internal/pool.(*ConnPool).reaper")
 	defer goleak.VerifyNone(t, ignoreOpt)
 
-	srv := NewServer(RedisClientOpt{Addr: ":6379"}, Config{LogLevel: testLogLevel})
+	srv := NewServer(getRedisConnOpt(t), Config{LogLevel: testLogLevel})
 
 	done := make(chan struct{})
 	// Make sure server exits when receiving TERM signal.
 	go func() {
 		time.Sleep(2 * time.Second)
-		syscall.Kill(syscall.Getpid(), syscall.SIGTERM)
+		_ = syscall.Kill(syscall.Getpid(), syscall.SIGTERM)
 		done <- struct{}{}
 	}()
 
@@ -83,7 +110,7 @@ func TestServerRun(t *testing.T) {
 }
 
 func TestServerErrServerClosed(t *testing.T) {
-	srv := NewServer(RedisClientOpt{Addr: ":6379"}, Config{LogLevel: testLogLevel})
+	srv := NewServer(getRedisConnOpt(t), Config{LogLevel: testLogLevel})
 	handler := NewServeMux()
 	if err := srv.Start(handler); err != nil {
 		t.Fatal(err)
@@ -96,7 +123,7 @@ func TestServerErrServerClosed(t *testing.T) {
 }
 
 func TestServerErrNilHandler(t *testing.T) {
-	srv := NewServer(RedisClientOpt{Addr: ":6379"}, Config{LogLevel: testLogLevel})
+	srv := NewServer(getRedisConnOpt(t), Config{LogLevel: testLogLevel})
 	err := srv.Start(nil)
 	if err == nil {
 		t.Error("Starting server with nil handler: (*Server).Start(nil) did not return error")
@@ -105,7 +132,7 @@ func TestServerErrNilHandler(t *testing.T) {
 }
 
 func TestServerErrServerRunning(t *testing.T) {
-	srv := NewServer(RedisClientOpt{Addr: ":6379"}, Config{LogLevel: testLogLevel})
+	srv := NewServer(getRedisConnOpt(t), Config{LogLevel: testLogLevel})
 	handler := NewServeMux()
 	if err := srv.Start(handler); err != nil {
 		t.Fatal(err)
@@ -126,7 +153,7 @@ func TestServerWithRedisDown(t *testing.T) {
 	}()
 	r := rdb.NewRDB(setup(t))
 	testBroker := testbroker.NewTestBroker(r)
-	srv := NewServer(RedisClientOpt{Addr: ":6379"}, Config{LogLevel: testLogLevel})
+	srv := NewServer(getRedisConnOpt(t), Config{LogLevel: testLogLevel})
 	srv.broker = testBroker
 	srv.forwarder.broker = testBroker
 	srv.heartbeater.broker = testBroker
@@ -182,7 +209,7 @@ func TestServerWithFlakyBroker(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		_, err := c.Enqueue(NewTask("enqueued", nil), MaxRetry(i))
 		if err != nil {
 			t.Fatal(err)

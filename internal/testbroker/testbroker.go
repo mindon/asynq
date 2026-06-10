@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/redis/go-redis/v9"
 	"github.com/hibiken/asynq/internal/base"
+	"github.com/redis/go-redis/v9"
 )
 
 var errRedisDown = errors.New("testutil: redis is down")
@@ -62,6 +62,15 @@ func (tb *TestBroker) EnqueueUnique(ctx context.Context, msg *base.TaskMessage, 
 		return errRedisDown
 	}
 	return tb.real.EnqueueUnique(ctx, msg, ttl)
+}
+
+func (tb *TestBroker) BatchEnqueue(ctx context.Context, items []base.BatchEnqueueItem) (int, error) {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.sleeping {
+		return 0, errRedisDown
+	}
+	return tb.real.BatchEnqueue(ctx, items)
 }
 
 func (tb *TestBroker) Dequeue(qnames ...string) (*base.TaskMessage, time.Time, error) {
@@ -145,13 +154,13 @@ func (tb *TestBroker) ForwardIfReady(qnames ...string) error {
 	return tb.real.ForwardIfReady(qnames...)
 }
 
-func (tb *TestBroker) DeleteExpiredCompletedTasks(qname string) error {
+func (tb *TestBroker) DeleteExpiredCompletedTasks(qname string, batchSize int) error {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
 	if tb.sleeping {
 		return errRedisDown
 	}
-	return tb.real.DeleteExpiredCompletedTasks(qname)
+	return tb.real.DeleteExpiredCompletedTasks(qname, batchSize)
 }
 
 func (tb *TestBroker) ListLeaseExpired(cutoff time.Time, qnames ...string) ([]*base.TaskMessage, error) {
@@ -296,4 +305,7 @@ func (tb *TestBroker) ReclaimStaleAggregationSets(qname string) error {
 		return errRedisDown
 	}
 	return tb.real.ReclaimStaleAggregationSets(qname)
+}
+
+func (tb *TestBroker) SetTaskProber(prober base.TaskProber) {
 }

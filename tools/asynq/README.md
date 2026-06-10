@@ -25,7 +25,7 @@ To view details on any command, use `asynq help <command> <subcommand>`.
 - `asynq dash`
 - `asynq stats`
 - `asynq queue [ls inspect history rm pause unpause]`
-- `asynq task [ls cancel delete archive run delete-all archive-all run-all]`
+- `asynq task [ls cancel delete archive run deleteall archiveall runall]`
 - `asynq server [ls]`
 
 ### Global flags
@@ -39,6 +39,7 @@ By default, CLI will try to connect to a redis server running at `localhost:6379
       --config string          config file to set flag defaut values (default is $HOME/.asynq.yaml)
   -n, --db int                 redis database number (default is 0)
   -h, --help                   help for asynq
+  -U, --username string        username to use when connecting to redis server
   -p, --password string        password to use when connecting to redis server
   -u, --uri string             redis server URI (default "127.0.0.1:6379")
 
